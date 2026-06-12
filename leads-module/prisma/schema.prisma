@@ -1,0 +1,424 @@
+// Hektaria · Leads Module — Prisma Schema
+// PostgreSQL · Prisma ORM
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────
+// PARCELS & CADASTRE
+// ─────────────────────────────────────────
+
+model Parcel {
+  id            String   @id @default(cuid())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Identifikace z ČÚZK / RUIAN
+  kodParcely    String   @unique          // KÚ + parcelní číslo, eg. "724858_1234/5"
+  parcelniCislo String                    // eg. "1234/5"
+  kuKod         String                   // kód katastrálního území
+  kuNazev       String                   // název katastrálního území
+  obec          String
+  okres         String
+  kraj          String
+
+  // Geometrie (WKT polygon nebo centroid)
+  lat           Float?
+  lng           Float?
+  geomWkt       String?  @db.Text        // WKT polygon pro výpočty vzdálenosti
+
+  // Atributy z KN
+  vymera        Int                       // m²
+  druhPozemku   LandType
+  zpusobVyuziti String?
+  bonita        String?                  // BPEJ kód
+  uredniCena    Float?                   // Kč/m², z vyhlášky 298/2014
+
+  // Dopočítané hodnoty
+  vzdalenostZastavby  Float?             // m, od nejbližší budovy
+  vzdalenostKomunikace Float?            // m, od nejbližší cesty
+  jeBezPristupu  Boolean @default(false)
+  maStavebniPotencial Boolean @default(false)
+
+  // Vztahy
+  ownerships    ParcelOwnership[]
+  lead          Lead?
+  score         AttractivenessScore?
+  aiAnalysis    AIAnalysis?
+  nearbyParcels NearbyParcel[]           @relation("ParcelNearby")
+
+  @@index([kuKod])
+  @@index([okres])
+  @@index([kraj])
+  @@index([druhPozemku])
+  @@index([vymera])
+}
+
+enum LandType {
+  ORNA_PUDA
+  TTP                  // trvalý travní porost
+  LESNI_POZEMEK
+  OVOCNY_SAD
+  ZAHRADA
+  OSTATNI_PLOCHA
+  VODNI_PLOCHA
+  ZASTAVENA_PLOCHA
+  STAVEBNI_PARCELA
+}
+
+// ─────────────────────────────────────────
+// OWNERS
+// ─────────────────────────────────────────
+
+model Owner {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Identita (fyzická nebo právnická osoba)
+  typ         OwnerType
+  jmeno       String?                    // fyzická osoba
+  prijmeni    String?
+  nazevFirmy  String?                    // právnická osoba
+  rc          String?  @unique           // rodné číslo (hash)
+  ico         String?  @unique           // IČO
+
+  // Adresa
+  ulice       String?
+  obec        String?
+  psc         String?
+  stat        String   @default("CZ")
+
+  // Kontakt (dostupný z veřejných zdrojů)
+  telefon     String?
+  email       String?
+  datumNarozeni DateTime?
+
+  // Analytika
+  pocetParcel  Int      @default(0)     // denormalizované pro výkon
+  celkovaVymera Int     @default(0)     // m²
+
+  // Vztahy
+  ownerships  ParcelOwnership[]
+  leads       LeadOwner[]
+
+  @@index([prijmeni])
+  @@index([obec])
+}
+
+enum OwnerType {
+  FYZICKA_OSOBA
+  PRAVNICKA_OSOBA
+  STAT
+  OBEC
+  SPOLECENSTVI
+}
+
+model ParcelOwnership {
+  id         String  @id @default(cuid())
+  parcel     Parcel  @relation(fields: [parcelId], references: [id], onDelete: Cascade)
+  parcelId   String
+  owner      Owner   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  ownerId    String
+
+  podilCitatel  Int  @default(1)        // čitatel spoluvlastnického podílu
+  podilJmenovatel Int @default(1)       // jmenovatel
+
+  @@unique([parcelId, ownerId])
+  @@index([parcelId])
+  @@index([ownerId])
+}
+
+// ─────────────────────────────────────────
+// SCORING
+// ─────────────────────────────────────────
+
+model AttractivenessScore {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+
+  parcel    Parcel   @relation(fields: [parcelId], references: [id], onDelete: Cascade)
+  parcelId  String   @unique
+
+  // Celkové skóre 0–100
+  celkove   Float
+
+  // Dílčí skóre (každé 0–100)
+  skoreVelikost    Float   // velikost pozemku
+  skorePoloha      Float   // kraj, oblast, dostupnost
+  skoreZastavba    Float   // blízkost zástavby / intravilánu
+  skoreKomunikace  Float   // přístup po komunikaci
+  skorePotencial   Float   // potenciál zástavby / rekonverze
+  skoreProdejeOkoli Float  // realizované prodeje v okolí
+  skoreVlastnictvi Float   // počet vlastníků, podíl
+
+  // Faktory jako JSON pro transparentnost
+  faktory   Json            // { name, value, weight, contribution }[]
+
+  // Kdy bylo přepočítáno
+  verze     Int    @default(1)
+
+  @@index([celkove])
+}
+
+// ─────────────────────────────────────────
+// AI ANALÝZA
+// ─────────────────────────────────────────
+
+model AIAnalysis {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+
+  parcel      Parcel   @relation(fields: [parcelId], references: [id], onDelete: Cascade)
+  parcelId    String   @unique
+
+  // Shrnutí
+  souhrn      String   @db.Text
+  vyhody      Json     // string[]
+  rizika      Json     // string[]
+
+  // Cenové doporučení
+  doporucenaVykupniCena    Float   // Kč celkem
+  doporucenaVykupniCenaM2  Float   // Kč/m²
+  doporucenaProdejniCena   Float
+  doporucenaProdejniCenaM2 Float
+  odhadovanyZisk           Float
+  odhadovanyZiskPct        Float
+
+  // Metadata
+  model       String   @default("claude-sonnet-4-6")
+  promptVerze String   @default("1.0")
+  tokeny      Int?
+
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────
+// LEADS
+// ─────────────────────────────────────────
+
+model Lead {
+  id          String     @id @default(cuid())
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  parcel      Parcel     @relation(fields: [parcelId], references: [id])
+  parcelId    String     @unique
+
+  // Stav
+  stav        LeadStatus @default(NOVY)
+
+  // Odkud lead pochází
+  zdroj       LeadSource @default(AUTOMATICKY)
+  searchJobId String?
+
+  // Označení / priorita
+  priorita    Int        @default(0)    // 0–3
+  tags        String[]
+
+  // Poznámky
+  poznamky    String?    @db.Text
+
+  // Přiřazení
+  assigneeId  String?
+
+  // Vlastníci
+  owners      LeadOwner[]
+
+  // Historie stavů
+  history     LeadStatusHistory[]
+
+  // Aktivity
+  aktivity    LeadActivity[]
+
+  @@index([stav])
+  @@index([createdAt])
+  @@index([priorita])
+}
+
+enum LeadStatus {
+  NOVY
+  PRIPRAVENO_K_OSLOVENI
+  OSLOVENO
+  JEDNANI
+  NABIDKA_ODESLANA
+  KOUPENO
+  ZAMITNUTO
+  ARCHIVOVANO
+}
+
+enum LeadSource {
+  AUTOMATICKY         // denní job
+  RUCNE               // přidán ručně
+  IMPORT              // hromadný import
+}
+
+model LeadOwner {
+  id      String @id @default(cuid())
+  lead    Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId  String
+  owner   Owner  @relation(fields: [ownerId], references: [id])
+  ownerId String
+
+  jeHlavni Boolean @default(false)     // hlavní kontakt pro daný lead
+
+  @@unique([leadId, ownerId])
+}
+
+model LeadStatusHistory {
+  id        String     @id @default(cuid())
+  createdAt DateTime   @default(now())
+  lead      Lead       @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId    String
+  stavZ     LeadStatus?
+  stavDo    LeadStatus
+  poznamka  String?
+  userId    String?
+
+  @@index([leadId])
+}
+
+model LeadActivity {
+  id        String       @id @default(cuid())
+  createdAt DateTime     @default(now())
+  lead      Lead         @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId    String
+  typ       ActivityType
+  popis     String
+  userId    String?
+
+  @@index([leadId])
+}
+
+enum ActivityType {
+  POZNAMKA
+  TELEFON
+  EMAIL
+  SCHUZKA
+  NABIDKA
+  SMLOUVA
+  SYSTEM
+}
+
+// ─────────────────────────────────────────
+// AUTOMATICKÉ VYHLEDÁVÁNÍ
+// ─────────────────────────────────────────
+
+model SearchCriteria {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  nazev       String
+  aktivni     Boolean  @default(true)
+
+  // Lokace
+  kraj        String?
+  okres       String?
+  obec        String?
+  kuKod       String?  // konkrétní k.ú.
+
+  // Pozemek
+  druhyPozemku LandType[]
+  vymeraMin   Int?     // m²
+  vymeraMax   Int?
+
+  // Vlastnictví
+  maxPocetVlastniku Int?
+  minPodil      Float?   // min. podíl vlastníka (0–1)
+  typyVlastnictvi OwnerType[]
+
+  // Vzdálenosti
+  maxVzdalenostZastavby Float?    // m
+  maxVzdalenostKomunikace Float?  // m
+
+  // Cena
+  maxUredniCena Float?  // Kč/m²
+  minSkore      Float?  // min. atraktivitní skóre (0–100)
+
+  // Kolikrát denně spouštět (0 = jen 1× ráno)
+  denneOpakovani Int @default(0)
+
+  jobs  SearchJob[]
+
+  @@index([aktivni])
+}
+
+model SearchJob {
+  id              String     @id @default(cuid())
+  createdAt       DateTime   @default(now())
+  completedAt     DateTime?
+
+  criteria        SearchCriteria @relation(fields: [criteriaId], references: [id])
+  criteriaId      String
+
+  stav            JobStatus  @default(CEKA)
+  chybova         String?    @db.Text
+
+  // Výsledky
+  nalezenoParcel  Int        @default(0)
+  novychLeadu     Int        @default(0)
+  aktualizovano   Int        @default(0)
+
+  @@index([stav])
+  @@index([createdAt])
+}
+
+enum JobStatus {
+  CEKA
+  BEZI
+  DOKONCENO
+  CHYBA
+}
+
+// ─────────────────────────────────────────
+// DENNÍ REPORT
+// ─────────────────────────────────────────
+
+model DailyReport {
+  id          String   @id @default(cuid())
+  datum       DateTime @db.Date @unique
+
+  // Celkové metriky
+  novychLeadu         Int
+  oslovenoVlastniku   Int
+  aktivnichJednani    Int
+  koupenoParcel       Int
+  odhadovanyZisk      Float    // Kč, z AI analýz nových leadů
+
+  // Top příležitosti (JSON pole lead IDs + skóre)
+  topPrilezitosti Json         // { leadId, parcelId, skore, kuNazev, ... }[]
+
+  // Snapshot stavů
+  stavySnapshot Json           // { stav: LeadStatus, count }[]
+
+  // Porovnání s předchozím dnem
+  zmenaLeadu      Int          // delta vs. předchozí den
+  zmenaOdhadZisk  Float
+
+  generovanoAt DateTime @default(now())
+
+  @@index([datum])
+}
+
+// ─────────────────────────────────────────
+// NEARBY PARCELS (pro scoring okolních prodejů)
+// ─────────────────────────────────────────
+
+model NearbyParcel {
+  id          String @id @default(cuid())
+  parcel      Parcel @relation("ParcelNearby", fields: [parcelId], references: [id])
+  parcelId    String
+  vzdalenost  Float  // m
+  prodejniCena Float // Kč/m²
+  datumProdeje DateTime
+  druhPozemku LandType
+
+  @@index([parcelId])
+}
